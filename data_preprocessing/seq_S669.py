@@ -1,86 +1,85 @@
+import io
 import pandas as pd
 import requests
 from Bio import SeqIO
-import io
-import time
 
-# 1. Load the s669 dataset
-df = pd.read_csv("S669.csv")
+#! load dataset
+df = pd.read_csv("raw_data/S669.csv")
+df["pdb_id"] = df["Protein"].str[:4]
+df["chain"] = df["Protein"].str[4:]
 
-# 2. Function to fetch the absolute Wild-Type sequence using the PDB ID
-def fetch_wildtype_sequence(pdb_id):
-    pdb_id = pdb_id.lower()[:4]  # first 4 char is the pdb id
-    url = f"https://www.rcsb.org/fasta/entry/{pdb_id}"
-
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            fasta_io = io.StringIO(response.text)
-            for record in SeqIO.parse(fasta_io, "fasta"):
-                return str(record.seq).upper()
-        return None
-    except Exception:
-        return None
-
-# 3. Function to modify the Wild-Type sequence to create the Mutant sequence
-def generate_mutant_sequence(row):
-    wild_seq = row['Wt_seq']
-    mutation = str(row['Mut']) # e.g., "S11A"
-    
-    if not wild_seq or pd.isna(wild_seq):
-        return None
-        
-    try:
-        wt_aa = mutation[0].upper()     # Original Amino Acid (e.g., 'S')
-        mut_aa = mutation[-1].upper()   # Target Mutant Amino Acid (e.g., 'A')
-        
-        # Convert 1-based PDB position index into 0-based Python string index
-        pos = int(mutation[1:-1]) - 1 
-        
-        # Verification Check: Ensure the WT residue actually matches the position
-        if pos < len(wild_seq) and wild_seq[pos] == wt_aa:
-            seq_list = list(wild_seq)
-            seq_list[pos] = mut_aa
-            return "".join(seq_list)
-        else:
-            return None # Skip due to offset or indexing mismatch
-    except Exception:
-        return None
-
-# --- EXECUTE THE PIPELINE ---
-
-print("Step 1: Fetching original sequences from RCSB PDB...")
-# Map unique PDB codes first to minimize API calls
-unique_pdbs = df['Protein'].unique()
+# Fetch unique wild-type sequences with global tracking
 pdb_seq_map = {}
+successful_wt_count = 0
 
-for pdb in unique_pdbs:
-    pdb_seq_map[pdb] = fetch_wildtype_sequence(pdb)
-    time.sleep(0.1) # Soft polite delay for the server
+for _, row in df[["pdb_id", "chain"]].drop_duplicates().iterrows():
+    pdb_id, chain_id = row["pdb_id"], row["chain"]
+    try:
+        response = requests.get(
+            f"https://www.rcsb.org/fasta/entry/{pdb_id}", timeout=10
+        )
+        if response.status_code == 200:
+            # Parse FASTA records to find exact matching chain
+            chains = {
+                rec.id.split(":")[-1].strip().upper(): str(rec.seq).upper()
+                for rec in SeqIO.parse(io.StringIO(response.text), "fasta")
+            }
+            if chain_id in chains:
+                pdb_seq_map[(pdb_id, chain_id)] = chains[chain_id]
+                successful_wt_count += 1
+                continue
+    except Exception:
+        pass
 
-# Create and map initial required structural columns
-df['Mut'] = df['Mut_seq']
-df['Wt_seq'] = df['Protein'].map(pdb_seq_map)
+    # If logic reaches here, fetching failed for this protein combo
+    print(
+        f"Failed to fetch wild type sequence {pdb_id} (supposed chain {chain_id})"
+    )
 
-print("Step 2: Deriving mutated sequences...")
-df['Mut_seq_derived'] = df.apply(generate_mutant_sequence, axis=1)
+print(f"Successfully fetch {successful_wt_count} wild-type sequences")
 
-# Rename experimental ground-truth column to match target specification
-df['DDG'] = df['DDG_checked_dir']
+# Map sequences back and drop missing wildtypes
+df["wildtype_seq"] = df.set_index(["pdb_id", "chain"]).index.map(pdb_seq_map)
+df = df.dropna(subset=["wildtype_seq"]).copy()
 
-# 4. Final Dataset Structuring & Cleaning
-# Drop rows where the sequence could not be fetched or mutation mapping failed
-df_cleaned = df.dropna(subset=['Wt_seq', 'Mut_seq_derived'])
+# Derive mutant sequences
+mutant_seqs = []
+successful_mut_count = 0
 
-# Select and order exactly according to your layout request
-final_columns = ['Protein', 'Mut', 'Wt_seq', 'Mut_seq', 'DDG']
-# Replace old text tracking with our validated derived sequence column
-df_cleaned = df_cleaned.rename(columns={'Mut_seq_derived': 'Mut_seq'})
-df_final = df_cleaned[final_columns]
+for _, row in df.iterrows():
+    wt_seq = row["wildtype_seq"]
+    mut = str(row["PDB_Mut"])
+    try:
+        wt_aa, mut_aa, pos = mut[0].upper(), mut[-1].upper(), int(mut[1:-1]) - 1
+        if 0 <= pos < len(wt_seq) and wt_seq[pos] == wt_aa:
+            mut_seq = wt_seq[:pos] + mut_aa + wt_seq[pos + 1 :]
+            mutant_seqs.append(mut_seq)
+            successful_mut_count += 1
+            continue
+    except Exception:
+        pass
 
-# Save output to a clean CSV
-df_final.to_csv("S669_cleaned.csv", index=False)
-print("Pipeline complete. Processed output saved to 's669_ordered_cleaned.csv'")
+    print(f"Failed to derive mutant sequence {row['Protein']} with mutation {mut}")
+    mutant_seqs.append(None)
 
-# View the final formatted layout matrix matching your target example
-print(df_final.head(1))
+print(f"Successfully derived {successful_mut_count} mutant sequences")
+
+# Assign mutant sequences and drop failures
+df["mutant_seq"] = mutant_seqs
+df = df.dropna(subset=["mutant_seq"])
+
+# Select, rename and save final columns according to the schema
+final_df = pd.DataFrame(
+    {
+        "pdb_id": df["pdb_id"],
+        "chain": df["chain"],
+        "wildtype_seq": df["wildtype_seq"],
+        "mutant_seq": df["mutant_seq"],
+        "temperature": df["TEMP"],
+        "pH": df["pH"],
+        "ddG_dir": df["DDG_checked_dir"],
+        "ddG_inv": df["DDG_checked_inv"],
+    }
+)
+
+final_df.to_csv("seq_S669.csv", index=False)
